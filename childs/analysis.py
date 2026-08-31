@@ -1,11 +1,14 @@
 import json
 import re
 import shutil
+import subprocess
 from pathlib import Path
+from collections import defaultdict
 
 from childs.helpers import (
     write_text,
     run_command,
+    run_command_capture,
 )
 
 
@@ -135,13 +138,78 @@ SENSITIVE_PATTERNS = {
 # FLUTTER / DART
 # ============================================================
 
-def find_arm64_libapp(files_dir, target_arch):
+COMMON_ABI_ORDER = [
+    "arm64-v8a",
+    "armeabi-v7a",
+    "x86_64",
+    "x86",
+]
+
+COMMON_PUB_PACKAGES = {
+    "bloc",
+    "cached_network_image",
+    "camera",
+    "cloud_firestore",
+    "connectivity_plus",
+    "dio",
+    "device_info_plus",
+    "firebase_analytics",
+    "firebase_auth",
+    "firebase_core",
+    "firebase_database",
+    "firebase_messaging",
+    "firebase_storage",
+    "flutter_bloc",
+    "flutter_local_notifications",
+    "flutter_secure_storage",
+    "geolocator",
+    "get",
+    "get_it",
+    "google_sign_in",
+    "hive",
+    "hive_flutter",
+    "http",
+    "image_picker",
+    "in_app_review",
+    "intl",
+    "just_audio",
+    "package_info_plus",
+    "path_provider",
+    "permission_handler",
+    "provider",
+    "riverpod",
+    "shared_preferences",
+    "sqflite",
+    "url_launcher",
+    "video_player",
+    "webview_flutter",
+}
+
+
+def _guess_abi_from_path(path):
     """
-    Search for libapp.so recursively.
+    Guess the ABI from a libapp.so path.
+    """
 
-    Do not assume that it is necessarily located at:
+    path = Path(path)
+    lower = str(path).lower()
 
-        lib/arm64-v8a/libapp.so
+    for abi in COMMON_ABI_ORDER:
+
+        if abi in lower:
+            return abi
+
+    for part in path.parts:
+
+        if part.lower().startswith("arm") or part.lower().startswith("x86"):
+            return part.lower()
+
+    return None
+
+
+def discover_libapp_candidates(files_dir, preferred_abi):
+    """
+    Find every libapp.so candidate and rank them by ABI.
     """
 
     files_dir = Path(files_dir)
@@ -153,22 +221,51 @@ def find_arm64_libapp(files_dir, target_arch):
         if not path.is_file():
             continue
 
-        candidates.append(path)
+        abi = _guess_abi_from_path(path)
+
+        score = 100
+
+        if abi == preferred_abi:
+            score = 0
+        elif abi in COMMON_ABI_ORDER:
+            score = 10 + COMMON_ABI_ORDER.index(abi)
+
+        candidates.append(
+            {
+                "path": path,
+                "abi": abi or "unknown",
+                "score": score,
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (
+            item["score"],
+            str(item["path"]).lower()
+        )
+    )
+
+    return candidates
+
+
+def find_arm64_libapp(files_dir, target_arch):
+    """
+    Search for libapp.so recursively.
+
+    Do not assume that it is necessarily located at:
+
+        lib/arm64-v8a/libapp.so
+    """
+
+    candidates = discover_libapp_candidates(
+        files_dir,
+        target_arch
+    )
 
     if not candidates:
         return None
 
-    # Prefer the requested ABI.
-    preferred = [
-        path
-        for path in candidates
-        if target_arch in str(path)
-    ]
-
-    if preferred:
-        return preferred[0]
-
-    return candidates[0]
+    return candidates[0]["path"]
 
 
 
@@ -185,9 +282,26 @@ def prepare_flutter(
     files_dir = Path(files_dir)
     flutter_dir = Path(flutter_dir)
 
+    candidates = discover_libapp_candidates(
+        files_dir,
+        target_arch
+    )
+
+    selection = (
+        candidates[0]
+        if candidates
+        else None
+    )
+
+    selected_abi = (
+        selection["abi"]
+        if selection
+        else target_arch
+    )
+
     destination = (
         flutter_dir
-        / target_arch
+        / selected_abi
     )
 
     destination.mkdir(
@@ -195,9 +309,10 @@ def prepare_flutter(
         exist_ok=True
     )
 
-    libapp = find_arm64_libapp(
-        files_dir,
-        target_arch
+    libapp = (
+        selection["path"]
+        if selection
+        else None
     )
 
     # --------------------------------------------------------
@@ -233,6 +348,8 @@ def prepare_flutter(
         print()
         print("[+] Flutter libapp.so found:")
         print("    ", libapp)
+        print("[+] Selected ABI:")
+        print("    ", selected_abi)
 
     else:
 
@@ -311,6 +428,41 @@ def prepare_flutter(
             native_inventory,
             f,
             indent=4
+        )
+
+    selection_report = {
+        "preferred_abi": target_arch,
+        "selected_abi": (
+            selected_abi
+            if libapp
+            else None
+        ),
+        "selected_libapp": (
+            str(libapp)
+            if libapp
+            else None
+        ),
+        "candidates": [
+            {
+                "path": str(item["path"]),
+                "abi": item["abi"],
+                "score": item["score"],
+            }
+            for item in candidates
+        ],
+    }
+
+    with open(
+        flutter_dir / "selected_libapp.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            selection_report,
+            f,
+            indent=4,
+            ensure_ascii=False
         )
 
     return libapp
@@ -1181,6 +1333,1118 @@ def create_reconstructed_dart(
         directory / "reconstructed.dart",
         "\n".join(output)
     )
+
+
+def _dedupe_ordered(values):
+    seen = set()
+    result = []
+
+    for value in values:
+
+        if value in seen:
+            continue
+
+        seen.add(value)
+        result.append(value)
+
+    return result
+
+
+def _to_snake_case(value):
+    value = re.sub(r"[^A-Za-z0-9]+", "_", str(value))
+    value = re.sub(r"(?<!^)(?=[A-Z])", "_", value)
+    value = re.sub(r"_+", "_", value)
+    return value.strip("_").lower()
+
+
+def _to_pascal_case(value):
+    parts = re.split(r"[^A-Za-z0-9]+", str(value))
+    return "".join(part.capitalize() for part in parts if part)
+
+
+def _read_text_safely(path, limit=2 * 1024 * 1024):
+    path = Path(path)
+
+    try:
+        if not path.is_file():
+            return ""
+        if path.stat().st_size > limit:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _scan_text_evidence(root, suffixes):
+    root = Path(root)
+
+    evidence = {
+        "class_names": set(),
+        "method_channels": set(),
+        "event_channels": set(),
+        "basic_channels": set(),
+        "urls": set(),
+        "activity_names": set(),
+        "package_names": set(),
+        "firebase_signals": set(),
+        "state_management_signals": set(),
+    }
+
+    if not root.exists():
+        return evidence
+
+    for path in root.rglob("*"):
+
+        if not path.is_file():
+            continue
+
+        if path.suffix.lower() not in suffixes:
+            continue
+
+        text = _read_text_safely(path)
+
+        if not text:
+            continue
+
+        evidence["class_names"].update(
+            re.findall(
+                r"\bclass\s+([A-Z][A-Za-z0-9_]+)",
+                text
+            )
+        )
+        evidence["method_channels"].update(
+            re.findall(
+                r"MethodChannel\(\s*['\"]([^'\"]+)['\"]",
+                text
+            )
+        )
+        evidence["event_channels"].update(
+            re.findall(
+                r"EventChannel\(\s*['\"]([^'\"]+)['\"]",
+                text
+            )
+        )
+        evidence["basic_channels"].update(
+            re.findall(
+                r"BasicMessageChannel\(\s*['\"]([^'\"]+)['\"]",
+                text
+            )
+        )
+        evidence["urls"].update(
+            re.findall(
+                r"https?://[^\s\"'<>]+",
+                text
+            )
+        )
+        evidence["activity_names"].update(
+            re.findall(
+                r"\b([A-Z][A-Za-z0-9_]*(?:Activity|Service|Receiver|Application))\b",
+                text
+            )
+        )
+        evidence["package_names"].update(
+            re.findall(
+                r"\bpackage\s+([a-zA-Z_][\w.]*)",
+                text
+            )
+        )
+
+        lower = text.lower()
+
+        if "firebase" in lower:
+            evidence["firebase_signals"].add(str(path))
+
+        if any(term in lower for term in ("provider", "bloc", "getmaterialapp", "getx", "riverpod")):
+            evidence["state_management_signals"].add(str(path))
+
+    return evidence
+
+
+def _infer_pub_dependencies(package_refs):
+    dependencies = []
+    evidence = []
+
+    for ref in package_refs:
+
+        match = re.match(
+            r"package:([a-zA-Z0-9_]+)(?:/|$)",
+            ref
+        )
+
+        if not match:
+            continue
+
+        package = match.group(1)
+
+        if package in {"flutter", "cupertino_icons"}:
+            continue
+
+        if package not in COMMON_PUB_PACKAGES:
+            continue
+
+        if package in dependencies:
+            continue
+
+        dependencies.append(package)
+        evidence.append(
+            {
+                "package": package,
+                "source_reference": ref,
+            }
+        )
+
+    return dependencies, evidence
+
+
+def _classify_type_name(name):
+    lowered = name.lower()
+
+    screen_terms = (
+        "screen",
+        "page",
+        "view",
+        "route",
+        "home",
+        "login",
+        "profile",
+        "detail",
+        "details",
+        "dashboard",
+        "settings",
+    )
+    widget_terms = (
+        "widget",
+        "card",
+        "button",
+        "dialog",
+        "tile",
+        "header",
+        "footer",
+        "item",
+        "row",
+        "panel",
+    )
+    model_terms = (
+        "model",
+        "entity",
+        "dto",
+        "request",
+        "response",
+        "payload",
+        "user",
+        "profile",
+        "config",
+        "setting",
+    )
+    service_terms = (
+        "service",
+        "api",
+        "client",
+        "repository",
+        "repo",
+        "bridge",
+        "channel",
+        "provider",
+        "bloc",
+        "cubit",
+        "controller",
+        "manager",
+    )
+    util_terms = (
+        "util",
+        "utils",
+        "helper",
+        "helpers",
+        "constant",
+        "constants",
+        "formatter",
+        "validator",
+    )
+
+    if any(term in lowered for term in screen_terms):
+        return "screens"
+    if any(term in lowered for term in widget_terms):
+        return "widgets"
+    if any(term in lowered for term in model_terms):
+        return "models"
+    if any(term in lowered for term in service_terms):
+        return "services"
+    if any(term in lowered for term in util_terms):
+        return "utils"
+
+    return None
+
+
+def _build_type_candidates(analysis, java_source_dir, decoded_dir):
+    candidates = []
+    evidence = defaultdict(list)
+
+    for value in analysis.get("possible_type_names", []):
+        class_name = _to_pascal_case(value)
+        if class_name and class_name[0].isalpha():
+            candidates.append(class_name)
+            evidence[class_name].append(
+                {
+                    "source": "analysis.possible_type_names",
+                    "value": value,
+                }
+            )
+
+    for ref in analysis.get("dart_file_references", []):
+        stem = Path(ref).stem
+        class_name = _to_pascal_case(stem)
+        if class_name and class_name[0].isalpha():
+            candidates.append(class_name)
+            evidence[class_name].append(
+                {
+                    "source": "analysis.dart_file_references",
+                    "value": ref,
+                }
+            )
+
+    java_evidence = _scan_text_evidence(
+        java_source_dir,
+        {".java", ".kt", ".xml", ".txt"}
+    )
+    resource_evidence = _scan_text_evidence(
+        decoded_dir,
+        {".xml", ".txt", ".json", ".smali", ".java", ".kt"}
+    )
+
+    for name in sorted(java_evidence["class_names"] | resource_evidence["class_names"]):
+        if name and name[0].isalpha():
+            candidates.append(name)
+            evidence[name].append(
+                {
+                    "source": "java_source/decoded source",
+                    "value": name,
+                }
+            )
+
+    candidates = _dedupe_ordered(
+        [
+            candidate
+            for candidate in candidates
+            if len(candidate) >= 3 and len(candidate) <= 80
+        ]
+    )
+
+    ranked = []
+
+    for candidate in candidates:
+        category = _classify_type_name(candidate)
+        if not category:
+            continue
+        score = 0
+        lowered = candidate.lower()
+        if any(lowered.endswith(term) for term in ("screen", "page", "view", "service", "model", "widget")):
+            score += 2
+        if candidate in analysis.get("possible_type_names", []):
+            score += 1
+        if candidate in [Path(ref).stem for ref in analysis.get("dart_file_references", [])]:
+            score += 1
+        ranked.append(
+            {
+                "class_name": candidate,
+                "category": category,
+                "score": score,
+                "evidence": evidence.get(candidate, []),
+            }
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            -item["score"],
+            item["class_name"].lower()
+        )
+    )
+
+    return ranked[:12], java_evidence, resource_evidence
+
+
+def _render_main_dart(app_title="Reconstructed App"):
+    return "\n".join(
+        [
+            "// Reconstructed from APK evidence.",
+            "// Original Dart source was not recovered.",
+            "",
+            "import 'package:flutter/material.dart';",
+            "",
+            "void main() {",
+            "  runApp(const ReconstructedApp());",
+            "}",
+            "",
+            "class ReconstructedApp extends StatelessWidget {",
+            "  const ReconstructedApp({super.key});",
+            "",
+            "  @override",
+            "  Widget build(BuildContext context) {",
+            "    return MaterialApp(",
+            f"      title: '{app_title}',",
+            "      home: const ReconstructedHomePage(),",
+            "    );",
+            "  }",
+            "}",
+            "",
+            "class ReconstructedHomePage extends StatelessWidget {",
+            "  const ReconstructedHomePage({super.key});",
+            "",
+            "  @override",
+            "  Widget build(BuildContext context) {",
+            "    return Scaffold(",
+            "      appBar: AppBar(",
+            f"        title: const Text('{app_title}'),",
+            "      ),",
+            "      body: const Center(",
+            "        child: Padding(",
+            "          padding: EdgeInsets.all(24),",
+            "          child: Text(",
+            "            'Flutter project reconstructed from APK evidence',",
+            "            textAlign: TextAlign.center,",
+            "          ),",
+            "        ),",
+            "      ),",
+            "    );",
+            "  }",
+            "}",
+            "",
+        ]
+    )
+
+
+def _render_screen_stub(class_name):
+    return "\n".join(
+        [
+            "// Reconstructed from APK evidence.",
+            "// Original Dart source was not recovered.",
+            "",
+            "import 'package:flutter/material.dart';",
+            "",
+            f"class {class_name} extends StatelessWidget {{",
+            f"  const {class_name}({{super.key}});",
+            "",
+            "  @override",
+            "  Widget build(BuildContext context) {",
+            "    return Scaffold(",
+            "      appBar: AppBar(",
+            f"        title: const Text('{class_name}'),",
+            "      ),",
+            "      body: Center(",
+            f"        child: Text('{class_name} reconstructed from APK evidence'),",
+            "      ),",
+            "    );",
+            "  }",
+            "}",
+            "",
+        ]
+    )
+
+
+def _render_widget_stub(class_name):
+    return "\n".join(
+        [
+            "// Reconstructed from APK evidence.",
+            "// Original Dart source was not recovered.",
+            "",
+            "import 'package:flutter/material.dart';",
+            "",
+            f"class {class_name} extends StatelessWidget {{",
+            f"  const {class_name}({{super.key}});",
+            "",
+            "  @override",
+            "  Widget build(BuildContext context) {",
+            "    return const SizedBox.shrink();",
+            "  }",
+            "}",
+            "",
+        ]
+    )
+
+
+def _render_model_stub(class_name):
+    return "\n".join(
+        [
+            "// Reconstructed from APK evidence.",
+            "// Original Dart source was not recovered.",
+            "",
+            f"class {class_name} {{",
+            f"  const {class_name}();",
+            "",
+            "  factory {0}.fromJson(Map<String, dynamic> json) {{".format(class_name),
+            f"    return const {class_name}();",
+            "  }",
+            "",
+            "  Map<String, dynamic> toJson() {",
+            "    return const <String, dynamic>{};",
+            "  }",
+            "}",
+            "",
+        ]
+    )
+
+
+def _render_service_stub(class_name, urls=None, channels=None, packages=None):
+    urls = urls or []
+    channels = channels or []
+    packages = packages or []
+
+    lines = [
+        "// Reconstructed from APK evidence.",
+        "// Original Dart source was not recovered.",
+        "",
+        "import 'package:flutter/services.dart';",
+        "",
+        f"class {class_name} {{",
+        f"  const {class_name}();",
+        "",
+    ]
+
+    if urls:
+        lines.append("  static const List<String> recoveredEndpoints = <String>[")
+        for url in urls[:20]:
+            lines.append(f"    '{url}',")
+        lines.append("  ];")
+        lines.append("")
+
+    if channels:
+        lines.append("  static const List<String> recoveredChannels = <String>[")
+        for channel in channels[:20]:
+            lines.append(f"    '{channel}',")
+        lines.append("  ];")
+        lines.append("")
+
+    if packages:
+        lines.append("  static const List<String> inferredDependencies = <String>[")
+        for package in packages:
+            lines.append(f"    '{package}',")
+        lines.append("  ];")
+        lines.append("")
+
+    lines.extend(
+        [
+            "  Future<String?> invokeMethod(",
+            "    String method, [",
+            "    Object? arguments,",
+            "  ]) async {",
+            "    const channel = MethodChannel('reconstructed_flutter/platform');",
+            "    final result = await channel.invokeMethod<String>(method, arguments);",
+            "    return result;",
+            "  }",
+            "}",
+            "",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def _render_platform_bridge_stub(channel_names):
+    lines = [
+        "// Reconstructed from APK evidence.",
+        "// Original Dart source was not recovered.",
+        "",
+        "import 'package:flutter/services.dart';",
+        "",
+        "class PlatformBridge {",
+        "  PlatformBridge({MethodChannel? channel})",
+        "      : _channel = channel ?? const MethodChannel('reconstructed_flutter/platform');",
+        "",
+        "  final MethodChannel _channel;",
+        "",
+        "  Future<T?> invoke<T>(String method, [Object? arguments]) async {",
+        "    return _channel.invokeMethod<T>(method, arguments);",
+        "  }",
+        "",
+    ]
+
+    if channel_names:
+        lines.append("  static const List<String> recoveredChannels = <String>[")
+        for channel in channel_names[:20]:
+            lines.append(f"    '{channel}',")
+        lines.append("  ];")
+        lines.append("")
+
+    lines.extend(
+        [
+            "}",
+            "",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def _render_limitations(selected_abi, missing_packages):
+    lines = [
+        "# Limitations",
+        "",
+        "- Original Dart source is not guaranteed to be recoverable.",
+        "- Release Flutter apps commonly contain compiled AOT Dart rather than readable source.",
+        "- Generated Dart in this project is reconstructed and inferred from APK evidence.",
+        "- Comments, original variable names, formatting, and project structure may be lost.",
+        "- The generated code should be reviewed before production use.",
+    ]
+
+    if selected_abi:
+        lines.append(
+            f"- The reconstructed project was generated from the selected ABI: `{selected_abi}`."
+        )
+
+    if missing_packages:
+        lines.append(
+            "- Some recovered package references could not be mapped confidently to pub.dev dependencies:"
+        )
+        for package in missing_packages:
+            lines.append(f"  - `{package}`")
+
+    return "\n".join(lines) + "\n"
+
+
+def _run_flutter_validation(project_dir):
+    project_dir = Path(project_dir)
+
+    validation_path = project_dir / "reconstruction" / "flutter_validation.txt"
+
+    if not shutil.which("flutter"):
+        write_text(
+            validation_path,
+            "Flutter was not installed or not available on PATH.\n"
+            "Skipped: flutter pub get\n"
+            "Skipped: flutter analyze\n"
+        )
+        return validation_path
+
+    outputs = []
+
+    for command in ("flutter pub get", "flutter analyze"):
+        code, output = run_command_capture(command, cwd=project_dir)
+        outputs.append(
+            f"$ {command}\nreturncode: {code}\n{output}\n"
+        )
+
+    write_text(
+        validation_path,
+        "\n".join(outputs)
+    )
+
+    return validation_path
+
+
+def generate_flutter_project(
+    output_dir,
+    analysis,
+    flutter_dir,
+    java_source_dir,
+    decoded_dir,
+    apk_path,
+):
+    """
+    Generate a compilable Flutter project scaffold from APK evidence.
+    """
+
+    output_dir = Path(output_dir)
+    flutter_dir = Path(flutter_dir)
+    java_source_dir = Path(java_source_dir)
+    decoded_dir = Path(decoded_dir)
+    apk_path = Path(apk_path)
+
+    print()
+    print("[+] Flutter project reconstruction started")
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    reconstruction_dir = output_dir / "reconstruction"
+    lib_dir = output_dir / "lib"
+    assets_dir = output_dir / "assets"
+
+    for path in (
+        reconstruction_dir,
+        lib_dir / "screens",
+        lib_dir / "widgets",
+        lib_dir / "models",
+        lib_dir / "services",
+        lib_dir / "utils",
+        assets_dir / "flutter_assets",
+    ):
+        path.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+    selected_info = {}
+    selected_path = flutter_dir / "selected_libapp.json"
+
+    if selected_path.exists():
+        try:
+            selected_info = json.loads(
+                selected_path.read_text(
+                    encoding="utf-8",
+                    errors="replace"
+                )
+            )
+        except Exception:
+            selected_info = {}
+
+    selected_abi = selected_info.get("selected_abi")
+
+    flutter_assets_source = flutter_dir / "flutter_assets"
+    copied_assets = 0
+
+    if flutter_assets_source.exists():
+        if (assets_dir / "flutter_assets").exists():
+            shutil.rmtree(assets_dir / "flutter_assets")
+        shutil.copytree(
+            flutter_assets_source,
+            assets_dir / "flutter_assets"
+        )
+        for path in (assets_dir / "flutter_assets").rglob("*"):
+            if path.is_file():
+                copied_assets += 1
+
+    pub_packages, package_evidence = _infer_pub_dependencies(
+        analysis.get("packages", [])
+    )
+
+    type_candidates, java_evidence, resource_evidence = _build_type_candidates(
+        analysis,
+        java_source_dir,
+        decoded_dir
+    )
+
+    package_refs = analysis.get("packages", [])
+    urls = analysis.get("urls", [])
+    dart_refs = analysis.get("dart_file_references", [])
+    framework_indicators = analysis.get("flutter_framework_indicators", [])
+    possible_types = analysis.get("possible_type_names", [])
+
+    reconstructed_files = {}
+
+    def record_file(relative_path, evidence_items):
+        reconstructed_files[relative_path] = evidence_items
+
+    # pubspec.yaml
+    pubspec_lines = [
+        "name: reconstructed_flutter_app",
+        "description: Reconstructed Flutter project generated from APK evidence.",
+        "publish_to: 'none'",
+        "version: 1.0.0+1",
+        "",
+        "environment:",
+        "  sdk: '>=3.0.0 <4.0.0'",
+        "",
+        "dependencies:",
+        "  flutter:",
+        "    sdk: flutter",
+    ]
+    for package in pub_packages:
+        pubspec_lines.append(f"  {package}: any")
+    pubspec_lines.extend(
+        [
+            "",
+            "dev_dependencies:",
+            "  flutter_test:",
+            "    sdk: flutter",
+            "",
+            "flutter:",
+            "  uses-material-design: true",
+            "  assets:",
+            "    - assets/flutter_assets/",
+            "",
+        ]
+    )
+    write_text(output_dir / "pubspec.yaml", "\n".join(pubspec_lines))
+    record_file(
+        "pubspec.yaml",
+        [
+            {"source": "analysis.packages", "values": package_refs},
+            {"source": "selected_libapp.json", "value": selected_abi},
+            {"source": "analysis.flutter_framework_indicators", "values": framework_indicators},
+        ]
+    )
+
+    app_title = "Reconstructed App"
+    if selected_info.get("selected_abi"):
+        app_title = f"Reconstructed App ({selected_info['selected_abi']})"
+
+    write_text(output_dir / "lib" / "main.dart", _render_main_dart(app_title=app_title))
+    record_file(
+        "lib/main.dart",
+        [
+            {"source": "analysis.flutter_framework_indicators", "values": framework_indicators},
+            {"source": "analysis.dart_file_references", "values": dart_refs},
+            {"source": "analysis.possible_type_names", "values": possible_types},
+            {"source": "manifest/jadx/apktool fallback template", "value": "MaterialApp fallback scaffold"},
+        ]
+    )
+
+    readme_lines = [
+        "# Reconstructed Flutter Project",
+        "",
+        "This project was generated from APK evidence and is intended as a compilable reconstruction scaffold.",
+        "",
+        "## Evidence sources",
+        "",
+        "- Flutter assets",
+        "- libapp.so string analysis",
+        "- Dart package and file references",
+        "- JADX Java/Kotlin output",
+        "- Apktool decoded resources",
+        "- AndroidManifest.xml",
+        "",
+        f"- Selected ABI: `{selected_abi or 'unknown'}`",
+        f"- Flutter assets copied: `{copied_assets}`",
+        "",
+        "## Notes",
+        "",
+        "- Original Dart source was not recovered.",
+        "- Generated source is inferred and should be reviewed before use.",
+        "",
+    ]
+    write_text(output_dir / "README.md", "\n".join(readme_lines))
+    record_file(
+        "README.md",
+        [
+            {"source": "analysis.*", "values": {
+                "packages": package_refs,
+                "dart_file_references": dart_refs,
+                "urls": urls,
+                "possible_type_names": possible_types,
+            }},
+            {"source": "flutter_assets", "value": str(flutter_assets_source)},
+            {"source": "selected_libapp.json", "value": selected_abi},
+        ]
+    )
+
+    # Targeted stubs from conservative evidence.
+    generated_type_files = []
+    for item in type_candidates:
+        class_name = item["class_name"]
+        category = item["category"]
+        file_name = f"{_to_snake_case(class_name)}.dart"
+        if category == "screens":
+            path = lib_dir / "screens" / file_name
+            contents = _render_screen_stub(class_name)
+        elif category == "widgets":
+            path = lib_dir / "widgets" / file_name
+            contents = _render_widget_stub(class_name)
+        elif category == "models":
+            path = lib_dir / "models" / file_name
+            contents = _render_model_stub(class_name)
+        else:
+            path = lib_dir / "services" / file_name
+            contents = _render_service_stub(
+                class_name,
+                urls=urls,
+                channels=list(java_evidence["method_channels"] | java_evidence["event_channels"] | java_evidence["basic_channels"]),
+                packages=pub_packages,
+            )
+
+        if path.exists():
+            continue
+
+        write_text(path, contents)
+        generated_type_files.append(str(path.relative_to(output_dir)))
+        record_file(
+            str(path.relative_to(output_dir)),
+            item.get("evidence", [])
+        )
+
+    # Service / integration stubs.
+    if urls:
+        api_service = lib_dir / "services" / "api_service.dart"
+        if not api_service.exists():
+            write_text(
+                api_service,
+                _render_service_stub(
+                    "ApiService",
+                    urls=urls,
+                    channels=list(java_evidence["method_channels"] | java_evidence["event_channels"] | java_evidence["basic_channels"]),
+                    packages=pub_packages,
+                )
+            )
+            record_file(
+                "lib/services/api_service.dart",
+                [
+                    {"source": "analysis.urls", "values": urls},
+                    {"source": "analysis.packages", "values": package_refs},
+                ]
+            )
+
+    channel_names = list(
+        _dedupe_ordered(
+            list(java_evidence["method_channels"])
+            + list(java_evidence["event_channels"])
+            + list(java_evidence["basic_channels"])
+        )
+    )
+    if channel_names:
+        platform_bridge = lib_dir / "services" / "platform_bridge.dart"
+        if not platform_bridge.exists():
+            write_text(
+                platform_bridge,
+                _render_platform_bridge_stub(channel_names)
+            )
+            record_file(
+                "lib/services/platform_bridge.dart",
+                [
+                    {"source": "java_source", "values": channel_names},
+                    {"source": "decoded resources", "values": sorted(resource_evidence["urls"])} if resource_evidence["urls"] else {"source": "decoded resources", "values": []},
+                ]
+            )
+
+    firebase_signals = _dedupe_ordered(
+        sorted(java_evidence["firebase_signals"])
+    )
+    if any("firebase" in value.lower() for value in framework_indicators) or any("firebase" in ref.lower() for ref in package_refs) or firebase_signals:
+        firebase_stub = lib_dir / "services" / "firebase_service.dart"
+        if not firebase_stub.exists():
+            write_text(
+                firebase_stub,
+                "\n".join(
+                    [
+                        "// Reconstructed from APK evidence.",
+                        "// Original Dart source was not recovered.",
+                        "",
+                        "class FirebaseService {",
+                        "  const FirebaseService();",
+                        "",
+                        "  Future<void> initialize() async {",
+                        "    // Placeholder initialization stub.",
+                        "  }",
+                        "}",
+                        "",
+                    ]
+                )
+            )
+            record_file(
+                "lib/services/firebase_service.dart",
+                [
+                    {"source": "analysis.flutter_framework_indicators", "values": framework_indicators},
+                    {"source": "analysis.packages", "values": package_refs},
+                    {"source": "java_source/decoded", "values": firebase_signals},
+                ]
+            )
+
+    if any(term in " ".join(framework_indicators).lower() for term in ("provider", "bloc", "getmaterialapp", "getx", "riverpod")):
+        state_stub = lib_dir / "services" / "state_management.dart"
+        if not state_stub.exists():
+            write_text(
+                state_stub,
+                "\n".join(
+                    [
+                        "// Reconstructed from APK evidence.",
+                        "// Original Dart source was not recovered.",
+                        "",
+                        "class StateManagementNotes {",
+                        "  const StateManagementNotes();",
+                        "}",
+                        "",
+                    ]
+                )
+            )
+            record_file(
+                "lib/services/state_management.dart",
+                [
+                    {"source": "analysis.flutter_framework_indicators", "values": framework_indicators},
+                    {"source": "analysis.packages", "values": package_refs},
+                ]
+            )
+
+    # Utility file with recovered URLs and package list.
+    constants_path = lib_dir / "utils" / "reconstruction_constants.dart"
+    if not constants_path.exists():
+        write_text(
+            constants_path,
+            "\n".join(
+                [
+                    "// Reconstructed from APK evidence.",
+                    "// Original Dart source was not recovered.",
+                    "",
+                    "class ReconstructionConstants {",
+                    "  const ReconstructionConstants();",
+                    "",
+                    "  static const List<String> recoveredUrls = <String>[",
+                ]
+                + [f"    '{url}'," for url in urls[:50]]
+                + [
+                    "  ];",
+                    "",
+                    "  static const List<String> recoveredPackages = <String>[",
+                ]
+                + [f"    '{package}'," for package in pub_packages]
+                + [
+                    "  ];",
+                    "}",
+                    "",
+                ]
+            )
+        )
+        record_file(
+            "lib/utils/reconstruction_constants.dart",
+            [
+                {"source": "analysis.urls", "values": urls},
+                {"source": "analysis.packages", "values": package_refs},
+            ]
+        )
+
+    limitations_path = reconstruction_dir / "limitations.md"
+    missing_packages = []
+    for package in package_refs:
+        match = re.match(r"package:([a-zA-Z0-9_]+)", package)
+        if not match:
+            continue
+        package_name = match.group(1)
+        if package_name == "flutter":
+            continue
+        if package_name not in pub_packages:
+            missing_packages.append(package_name)
+    write_text(
+        limitations_path,
+        _render_limitations(selected_abi, _dedupe_ordered(missing_packages))
+    )
+    record_file(
+        "reconstruction/limitations.md",
+        [
+            {"source": "analysis.packages", "values": package_refs},
+            {"source": "selected_libapp.json", "value": selected_abi},
+        ]
+    )
+
+    write_text(
+        reconstruction_dir / "packages.txt",
+        "\n".join(pub_packages)
+    )
+    write_text(
+        reconstruction_dir / "urls.txt",
+        "\n".join(urls)
+    )
+    write_text(
+        reconstruction_dir / "dart_files.txt",
+        "\n".join(dart_refs)
+    )
+    write_text(
+        reconstruction_dir / "types.txt",
+        "\n".join(
+            item["class_name"]
+            for item in type_candidates
+        )
+    )
+
+    record_file(
+        "reconstruction/packages.txt",
+        [
+            {"source": "analysis.packages", "values": package_refs},
+        ]
+    )
+    record_file(
+        "reconstruction/urls.txt",
+        [
+            {"source": "analysis.urls", "values": urls},
+        ]
+    )
+    record_file(
+        "reconstruction/dart_files.txt",
+        [
+            {"source": "analysis.dart_file_references", "values": dart_refs},
+        ]
+    )
+    record_file(
+        "reconstruction/types.txt",
+        [
+            {"source": "analysis.possible_type_names", "values": possible_types},
+            {"source": "java_source/decoded", "values": [item["class_name"] for item in type_candidates]},
+        ]
+    )
+
+    evidence = {
+        "apk_path": str(apk_path),
+        "selected_abi": selected_abi,
+        "flutter_assets_source": str(flutter_assets_source) if flutter_assets_source.exists() else None,
+        "copied_flutter_assets": copied_assets,
+        "analysis": {
+            "packages": package_refs,
+            "dart_file_references": dart_refs,
+            "urls": urls,
+            "flutter_framework_indicators": framework_indicators,
+            "possible_type_names": possible_types,
+        },
+        "source_scans": {
+            "java_source": {
+                "class_names": sorted(java_evidence["class_names"]),
+                "method_channels": sorted(java_evidence["method_channels"]),
+                "event_channels": sorted(java_evidence["event_channels"]),
+                "basic_channels": sorted(java_evidence["basic_channels"]),
+                "urls": sorted(java_evidence["urls"]),
+                "activity_names": sorted(java_evidence["activity_names"]),
+                "package_names": sorted(java_evidence["package_names"]),
+                "firebase_signals": sorted(java_evidence["firebase_signals"]),
+                "state_management_signals": sorted(java_evidence["state_management_signals"]),
+            },
+            "decoded_dir": {
+                "class_names": sorted(resource_evidence["class_names"]),
+                "method_channels": sorted(resource_evidence["method_channels"]),
+                "event_channels": sorted(resource_evidence["event_channels"]),
+                "basic_channels": sorted(resource_evidence["basic_channels"]),
+                "urls": sorted(resource_evidence["urls"]),
+                "activity_names": sorted(resource_evidence["activity_names"]),
+                "package_names": sorted(resource_evidence["package_names"]),
+                "firebase_signals": sorted(resource_evidence["firebase_signals"]),
+                "state_management_signals": sorted(resource_evidence["state_management_signals"]),
+            },
+        },
+        "generated_files": reconstructed_files,
+    }
+
+    write_text(
+        reconstruction_dir / "evidence.json",
+        json.dumps(
+            evidence,
+            indent=4,
+            ensure_ascii=False
+        )
+    )
+
+    validation_path = _run_flutter_validation(output_dir)
+
+    print(
+        "[+] Recovered packages:",
+        len(pub_packages)
+    )
+    print(
+        "[+] Recovered Dart references:",
+        len(dart_refs)
+    )
+    print(
+        "[+] Recovered URLs:",
+        len(urls)
+    )
+    print(
+        "[+] Recovered type candidates:",
+        len(type_candidates)
+    )
+    print(
+        "[+] Flutter assets copied:",
+        copied_assets
+    )
+    print(
+        "[+] Dart files generated:",
+        len(generated_type_files) + 1
+    )
+    print("[+] Reconstruction project:")
+    print("    ", output_dir)
+    print("[+] Validation:")
+    print("    ", validation_path)
+
+    return {
+        "project_dir": output_dir,
+        "validation_path": validation_path,
+        "selected_abi": selected_abi,
+        "packages": pub_packages,
+        "generated_files": reconstructed_files,
+    }
 
 
 # ============================================================

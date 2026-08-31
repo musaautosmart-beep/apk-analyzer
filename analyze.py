@@ -14,6 +14,7 @@ from childs.analysis import (
     analyze_dart,
     save_dart_analysis,
     create_reconstructed_dart,
+    generate_flutter_project,
     find_configuration,
     find_sensitive_files,
     analyze_native,
@@ -37,6 +38,7 @@ OUTPUT = BASE_DIR / "output"
 FILES = OUTPUT / "files"
 FLUTTER = OUTPUT / "flutter"
 DART = OUTPUT / "dart_reconstruction"
+RECONSTRUCTED = OUTPUT / "reconstructed_flutter"
 CONFIG = OUTPUT / "configuration"
 JAVA_SOURCE = OUTPUT / "java_source"
 DECODED = OUTPUT / "decoded"
@@ -344,6 +346,17 @@ def main():
             e
         )
 
+    def _selected_abi_from_libapp(path):
+        if not path:
+            return TARGET_ARCH
+        path_str = str(path).lower()
+        for abi in ("arm64-v8a", "armeabi-v7a", "x86_64", "x86"):
+            if abi in path_str:
+                return abi
+        return TARGET_ARCH
+
+    selected_arch = _selected_abi_from_libapp(libapp)
+
     # --------------------------------------------------------
     # Flutter assets
     # --------------------------------------------------------
@@ -412,13 +425,13 @@ def main():
                 strings=strings,
                 analysis=analysis,
                 dart_dir=DART,
-                target_arch=TARGET_ARCH
+                target_arch=selected_arch
             )
 
             create_reconstructed_dart(
                 analysis=analysis,
                 dart_dir=DART,
-                target_arch=TARGET_ARCH
+                target_arch=selected_arch
             )
 
         except Exception as e:
@@ -636,7 +649,7 @@ def main():
             output_dir=OUTPUT,
             analysis=analysis,
             libapp=libapp,
-            target_arch=TARGET_ARCH
+            target_arch=selected_arch
         )
 
     except Exception as e:
@@ -663,6 +676,38 @@ def main():
         apktool_result,
         report,
     )
+
+    # ========================================================
+    # 11. FLUTTER PROJECT RECONSTRUCTION
+    # ========================================================
+
+    print_section(
+        "11. FLUTTER PROJECT RECONSTRUCTION"
+    )
+
+    try:
+
+        reconstruction = generate_flutter_project(
+            output_dir=RECONSTRUCTED,
+            analysis=analysis,
+            flutter_dir=FLUTTER,
+            java_source_dir=JAVA_SOURCE,
+            decoded_dir=DECODED,
+            apk_path=apk_path,
+        )
+
+    except Exception as e:
+
+        reconstruction = {}
+
+        print(
+            "[!] Flutter project reconstruction failed:"
+        )
+
+        print(
+            "    ",
+            e
+        )
 
     # ========================================================
     # COMPLETE
@@ -699,7 +744,11 @@ def main():
 
     print()
     print("[+] Dart reconstruction:")
-    print("    ", DART / TARGET_ARCH)
+    print("    ", DART / selected_arch)
+
+    print()
+    print("[+] Reconstructed Flutter project:")
+    print("    ", RECONSTRUCTED)
 
     print()
     print("[+] JADX:")
@@ -726,7 +775,12 @@ def main():
     if libapp:
 
         print(
-            "[+] ARM64 libapp.so successfully analyzed."
+            "[+] libapp.so successfully analyzed."
+        )
+
+        print(
+            "[+] Selected ABI:",
+            selected_arch
         )
 
         print(
@@ -768,7 +822,7 @@ def main():
     else:
 
         print(
-            "[!] ARM64 libapp.so was not found."
+            "[!] libapp.so was not found."
         )
 
         print()
@@ -816,6 +870,8 @@ def main():
     print(
         "Next step: inspect the generated reconstruction reports."
     )
+
+    _ = reconstruction
 
 
 # ============================================================

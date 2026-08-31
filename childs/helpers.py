@@ -86,6 +86,40 @@ def run_command(command, title):
 
 
 # ============================================================
+# RUN COMMAND AND CAPTURE OUTPUT
+# ============================================================
+
+def run_command_capture(command, cwd=None):
+    """
+    Run a command and return (returncode, combined_output).
+    """
+
+    try:
+
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace"
+        )
+
+        return (
+            result.returncode,
+            result.stdout or ""
+        )
+
+    except Exception as e:
+
+        return (
+            1,
+            str(e)
+        )
+
+
+# ============================================================
 # APK EXTRACTION
 # ============================================================
 
