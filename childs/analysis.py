@@ -137,20 +137,39 @@ SENSITIVE_PATTERNS = {
 
 def find_arm64_libapp(files_dir, target_arch):
     """
-    Find Flutter's ARM64 libapp.so.
+    Search for libapp.so recursively.
+
+    Do not assume that it is necessarily located at:
+
+        lib/arm64-v8a/libapp.so
     """
 
-    target = (
-        Path(files_dir)
-        / "lib"
-        / target_arch
-        / "libapp.so"
-    )
+    files_dir = Path(files_dir)
 
-    if target.exists() and target.is_file():
-        return target
+    candidates = []
 
-    return None
+    for path in files_dir.rglob("libapp.so"):
+
+        if not path.is_file():
+            continue
+
+        candidates.append(path)
+
+    if not candidates:
+        return None
+
+    # Prefer the requested ABI.
+    preferred = [
+        path
+        for path in candidates
+        if target_arch in str(path)
+    ]
+
+    if preferred:
+        return preferred[0]
+
+    return candidates[0]
+
 
 
 def prepare_flutter(
@@ -159,25 +178,15 @@ def prepare_flutter(
     target_arch
 ):
     """
-    Copy ARM64 Flutter binaries into the output directory.
+    Locate Flutter native libraries regardless of their
+    exact extracted location.
     """
 
-    libapp = find_arm64_libapp(
-        files_dir,
-        target_arch
-    )
-
-    if not libapp:
-
-        print()
-        print(
-            "[!] ARM64 libapp.so was not found."
-        )
-
-        return None
+    files_dir = Path(files_dir)
+    flutter_dir = Path(flutter_dir)
 
     destination = (
-        Path(flutter_dir)
+        flutter_dir
         / target_arch
     )
 
@@ -186,36 +195,459 @@ def prepare_flutter(
         exist_ok=True
     )
 
-    shutil.copy2(
-        libapp,
-        destination / "libapp.so"
+    libapp = find_arm64_libapp(
+        files_dir,
+        target_arch
     )
 
-    flutter_engine = (
-        Path(files_dir)
-        / "lib"
-        / target_arch
-        / "libflutter.so"
-    )
+    # --------------------------------------------------------
+    # Search all Flutter native libraries
+    # --------------------------------------------------------
 
-    if flutter_engine.exists():
+    flutter_libs = []
+
+    for path in files_dir.rglob("*.so"):
+
+        if not path.is_file():
+            continue
+
+        name = path.name.lower()
+
+        if (
+            "flutter" in name
+            or "app" in name
+        ):
+            flutter_libs.append(path)
+
+    # --------------------------------------------------------
+    # Copy libapp
+    # --------------------------------------------------------
+
+    if libapp:
 
         shutil.copy2(
-            flutter_engine,
+            libapp,
+            destination / "libapp.so"
+        )
+
+        print()
+        print("[+] Flutter libapp.so found:")
+        print("    ", libapp)
+
+    else:
+
+        print()
+        print("[!] libapp.so was not found.")
+
+    # --------------------------------------------------------
+    # Copy libflutter
+    # --------------------------------------------------------
+
+    libflutter = None
+
+    for path in files_dir.rglob("libflutter.so"):
+
+        if path.is_file():
+
+            if target_arch in str(path):
+                libflutter = path
+                break
+
+            if libflutter is None:
+                libflutter = path
+
+    if libflutter:
+
+        shutil.copy2(
+            libflutter,
             destination / "libflutter.so"
+        )
+
+        print(
+            "[+] libflutter.so found:"
+        )
+
+        print(
+            "    ",
+            libflutter
+        )
+
+    else:
+
+        print(
+            "[-] libflutter.so not found."
+        )
+
+    # --------------------------------------------------------
+    # Native library inventory
+    # --------------------------------------------------------
+
+    native_inventory = []
+
+    for path in files_dir.rglob("*.so"):
+
+        if not path.is_file():
+            continue
+
+        native_inventory.append({
+            "path": str(
+                path.relative_to(files_dir)
+            ),
+            "name": path.name,
+            "size": path.stat().st_size
+        })
+
+    native_inventory.sort(
+        key=lambda x: x["path"].lower()
+    )
+
+    with open(
+        flutter_dir / "native_inventory.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            native_inventory,
+            f,
+            indent=4
+        )
+
+    return libapp
+
+def analyze_apk_structure(
+    apk_path,
+    output_dir
+):
+    """
+    Analyze the APK itself instead of relying only on the
+    extracted directory.
+    """
+
+    apk_path = Path(apk_path)
+    output_dir = Path(output_dir)
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    from childs.helpers import inspect_apk_archive
+
+    result = inspect_apk_archive(
+        apk_path
+    )
+
+    with open(
+        output_dir / "apk_structure.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            result,
+            f,
+            indent=4,
+            ensure_ascii=False
+        )
+
+    print()
+    print("=" * 70)
+    print("APK STRUCTURE")
+    print("=" * 70)
+
+    print(
+        "[+] APK entries:",
+        len(result["entries"])
+    )
+
+    print(
+        "[+] DEX files:",
+        len(result["dex_files"])
+    )
+
+    print(
+        "[+] Native .so files:",
+        len(result["native_libraries"])
+    )
+
+    print(
+        "[+] Flutter assets:",
+        len(result["flutter_assets"])
+    )
+
+    print(
+        "[+] Nested APKs:",
+        len(result["nested_apks"])
+    )
+
+    print(
+        "[+] ABI directories:",
+        ", ".join(
+            result["abi_directories"]
+        )
+        if result["abi_directories"]
+        else "NONE"
+    )
+
+    if result["split_indicators"]:
+
+        print()
+        print(
+            "[!] Possible split/bundle indicators:"
+        )
+
+        for item in result[
+            "split_indicators"
+        ][:30]:
+
+            print(
+                "    ",
+                item
+            )
+
+    if result["native_libraries"]:
+
+        print()
+        print(
+            "[+] Native libraries:"
+        )
+
+        for item in result[
+            "native_libraries"
+        ]:
+
+            print(
+                "    ",
+                item
+            )
+
+    return result
+
+def analyze_dex(
+    files_dir,
+    output_dir
+):
+    """
+    Inventory and perform lightweight textual analysis
+    of DEX files.
+
+    This does not decompile DEX. JADX does that later.
+    """
+
+    files_dir = Path(files_dir)
+    output_dir = Path(output_dir)
+
+    dex_dir = (
+        output_dir / "dex_analysis"
+    )
+
+    dex_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    dex_files = sorted(
+        files_dir.rglob("*.dex")
+    )
+
+    results = []
+
+    interesting_terms = [
+        "flutter",
+        "firebase",
+        "firestore",
+        "firebaseauth",
+        "methodchannel",
+        "eventchannel",
+        "flutteractivity",
+        "flutterengine",
+        "inappwebview",
+        "ultralytics",
+        "yolo",
+        "camera",
+        "location",
+        "youtube",
+        "sound",
+        "record",
+    ]
+
+    for dex in dex_files:
+
+        try:
+            data = dex.read_bytes()
+        except Exception:
+            continue
+
+        text = data.decode(
+            "latin-1",
+            errors="ignore"
+        )
+
+        matches = {}
+
+        lower = text.lower()
+
+        for term in interesting_terms:
+
+            count = lower.count(
+                term.lower()
+            )
+
+            if count:
+                matches[term] = count
+
+        results.append({
+            "file": str(
+                dex.relative_to(files_dir)
+            ),
+            "size": dex.stat().st_size,
+            "interesting_terms": matches
+        })
+
+        # Save a limited printable extraction.
+        strings = re.findall(
+            r"[ -~]{5,}",
+            text
+        )
+
+        strings = sorted(
+            set(strings)
+        )
+
+        interesting_strings = []
+
+        for value in strings:
+
+            low = value.lower()
+
+            if any(
+                term in low
+                for term in interesting_terms
+            ):
+                interesting_strings.append(
+                    value
+                )
+
+        write_text(
+            dex_dir
+            / f"{dex.name}.strings.txt",
+            "\n".join(
+                interesting_strings[:10000]
+            )
+        )
+
+    with open(
+        dex_dir / "dex_analysis.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            results,
+            f,
+            indent=4,
+            ensure_ascii=False
         )
 
     print()
     print(
-        "[+] ARM64 Flutter binary:"
+        "[+] DEX files analyzed:",
+        len(dex_files)
     )
+
+    return results
+
+    
+def analyze_manifest(
+    files_dir,
+    output_dir
+):
+    """
+    Extract important Android manifest indicators.
+    """
+
+    files_dir = Path(files_dir)
+    output_dir = Path(output_dir)
+
+    manifest = (
+        files_dir
+        / "AndroidManifest.xml"
+    )
+
+    if not manifest.exists():
+        return {}
+
+    try:
+        data = manifest.read_bytes()
+    except Exception:
+        return {}
+
+    text = data.decode(
+        "utf-8",
+        errors="replace"
+    )
+
+    # Also search printable strings because the manifest
+    # may be binary AXML.
+    printable = "\n".join(
+        re.findall(
+            r"[ -~]{3,}",
+            data.decode(
+                "latin-1",
+                errors="ignore"
+            )
+        )
+    )
+
+    combined = text + "\n" + printable
+
+    patterns = {
+        "flutter": r"(?i)flutter",
+        "activities": r"(?i)activity",
+        "services": r"(?i)service",
+        "receivers": r"(?i)receiver",
+        "providers": r"(?i)provider",
+        "permissions": r"(?i)permission",
+        "deep_links": r"(?i)http|https|intent-filter",
+        "firebase": r"(?i)firebase",
+        "google": r"(?i)google",
+    }
+
+    findings = {}
+
+    for name, pattern in patterns.items():
+
+        matches = re.findall(
+            pattern,
+            combined
+        )
+
+        findings[name] = len(matches)
+
+    write_text(
+        output_dir / "manifest_strings.txt",
+        printable
+    )
+
+    with open(
+        output_dir / "manifest_analysis.json",
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            findings,
+            f,
+            indent=4
+        )
+
+    print()
     print(
-        "    ",
-        libapp
+        "[+] Manifest analysis created."
     )
 
-    return libapp
-
+    return findings
 
 def copy_flutter_assets(
     files_dir,
